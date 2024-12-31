@@ -1,0 +1,7 @@
+source("06_modeling_ns.R")
+source("06_modeling_emp.R")
+source("06_modeling_capex.R")
+source("06_modeling_capex_and_emp.R")
+source("06_modeling_ns_and_emp.R")
+source("06_modeling_ns_and_emp_and_capex.R")
+source("06_modeling_ns_and_capex.R")

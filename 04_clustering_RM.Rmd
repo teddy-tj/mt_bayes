@@ -1,0 +1,620 @@
+---
+title: "04_clustering_RM"
+author: "Teodoras"
+date: "2024-11-16"
+output: html_document
+---
+
+## Options
+
+```{r setup, include=FALSE}
+rm(list = ls())
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(cluster)
+library(mclust)
+library(factoextra)
+library(fpc)
+library(clusterCrit)
+library(parallel)
+library(vcd)
+library(dbscan)
+library(ggfortify)
+library(kernlab)
+
+source("functions.R")
+
+replace_outliers_before_scaling <- TRUE
+
+# Directories
+dir1 <- "../Data/intermediate/"
+dir2 <- paste0(dir1, "final/")
+
+# Options
+reduce_dim <- FALSE
+
+rnd_vars <- c(
+  "rd", "op", "ns", "capex", "emp",
+  "log_rd", "log_ns", "log_capex", "log_emp",
+  "log_comp_shifted_op",
+  "rd_intensity", "cumulative_rd", "log_cum_rd"
+)
+
+# Variables for clustering
+mean_growth_vars <- NULL #c("emp")
+median_growth_vars <- c("rd", "emp")
+mean_vars <- c("log_op", "rd_intensity") #"log_op", "log_rd",
+
+rnd_vars_cluster <- c(
+  paste0(mean_growth_vars, "_growth_avg"),
+  paste0(median_growth_vars, "_growth_med"),
+  paste0(mean_vars, "_avg")
+)
+  
+rnd_vars_cluster <- rnd_vars_cluster[!grepl("^_", rnd_vars_cluster)]
+
+test_clust <- c("kmeans", "hierarchical", "complete_linkage")
+
+# Load data
+load(paste0(dir2, "03_final_data.Rdata"))
+
+
+```
+
+## Data Preparation
+
+```{r data-prep}
+# Prepare and order data for clustering
+dt_growth <- rnd_data %>%
+  # Select necessary columns
+  select(all_of(c(rnd_vars, "company_name", "isic4", "isic4_dh", "nace2", "year"))) %>%
+  arrange(company_name, year) %>%
+  group_by(company_name) %>%
+  # Calculate year-on-year growth rates for each variable
+  mutate(
+    rd_growth = (rd - lag(rd)) / lag(rd),
+    cumulative_rd_growth = (cumulative_rd - lag(cumulative_rd)) / lag(cumulative_rd),
+    ns_growth = (ns - lag(ns)) / lag(ns),
+    capex_growth = (capex - lag(capex)) / lag(capex),
+    op_growth = (op - lag(op)) / lag(op),
+    emp_growth = (emp - lag(emp)) / lag(emp),
+    rd_intensity_growth = (rd_intensity - lag(rd_intensity)) / lag(rd_intensity)
+  ) %>%
+  ungroup()
+
+# Aggregate by company, calculating average growth rates over periods
+dt_cluster_all <- dt_growth %>%
+  group_by(company_name) %>%
+  summarise(
+    rd_avg = mean(rd, na.rm = TRUE),
+    cumulative_rd_avg = mean(cumulative_rd, na.rm = TRUE),
+    ns_avg = mean(ns, na.rm = TRUE),
+    log_op_avg = mean(log_comp_shifted_op, na.rm = TRUE),
+    log_rd_avg = mean(log_rd, na.rm = TRUE),
+    log_cum_rd_avg = mean(log_cum_rd, na.rm = TRUE),
+    log_ns_avg = mean(log_rd, na.rm = TRUE),
+    capex_avg = mean(capex, na.rm = TRUE),
+    op_avg = mean(op, na.rm = TRUE),
+    emp_avg = mean(emp, na.rm = TRUE),
+    rd_intensity_avg = mean(rd_intensity, na.rm = TRUE),
+    rd_growth_avg = mean(rd_growth, na.rm = TRUE),
+    cumulative_rd_growth_avg = mean(cumulative_rd_growth, na.rm = TRUE),
+    ns_growth_avg = mean(ns_growth, na.rm = TRUE),
+    capex_growth_avg = mean(capex_growth, na.rm = TRUE),
+    op_growth_avg = mean(op_growth, na.rm = TRUE),
+    emp_growth_avg = mean(emp_growth, na.rm = TRUE),
+    rd_intensity_growth_avg = mean(rd_intensity_growth, na.rm = TRUE),
+        rd_intensity_med = median(rd_intensity, na.rm = TRUE),
+    rd_growth_med = median(rd_growth, na.rm = TRUE),
+    cumulative_rd_growth_med = median(cumulative_rd_growth, na.rm = TRUE),
+    ns_growth_med = median(ns_growth, na.rm = TRUE),
+    capex_growth_med = median(capex_growth, na.rm = TRUE),
+    op_growth_med = median(op_growth, na.rm = TRUE),
+    emp_growth_med = median(emp_growth, na.rm = TRUE),
+    rd_intensity_growth_med = median(rd_intensity_growth, na.rm = TRUE),
+    isic4 = paste0(unique(isic4), collapse = "|"),
+    isic4_dh = paste0(unique(isic4_dh), collapse = "|"),
+    nace2 = paste0(unique(nace2), collapse = "|")
+  ) %>%
+  ungroup()
+
+# Create quantile groups with custom names
+dt_cluster_all <- dt_cluster_all %>%
+  mutate(
+    emp_group = ntile(emp_avg, 4),
+    emp_group_name = case_when(
+      emp_group == 1 ~ "Small",
+      emp_group == 2 ~ "Medium-Small",
+      emp_group == 3 ~ "Medium-Big",
+      emp_group == 4 ~ "Big"
+    )
+  )
+
+# Arrange data by average employment
+dt_cluster_all <- dt_cluster_all %>%
+  arrange(emp_avg)
+
+# Calculate percentage changes between consecutive emp_avg values
+dt_cluster_all <- dt_cluster_all %>%
+  mutate(emp_change = (emp_avg / lag(emp_avg) - 1) * 100)
+
+# Calculate IQR for emp_change
+Q1 <- quantile(dt_cluster_all$emp_change, probs = 0.25, na.rm = TRUE)
+Q3 <- quantile(dt_cluster_all$emp_change, probs = 0.75, na.rm = TRUE)
+IQR_value <- Q3 - Q1
+
+# Define lower and upper bounds using 1.5 * IQR rule
+lower_bound <- Q1 - 1.5 * IQR_value
+upper_bound <- Q3 + 1.5 * IQR_value
+
+# Filter out outliers
+dt_filtered <- dt_cluster_all %>%
+  filter(emp_change >= lower_bound & emp_change <= upper_bound)
+
+# Identify indices where the top 3 largest percentage changes occur
+top_pct_change_indices <- order(dt_filtered$emp_change, decreasing = TRUE)[1:7]
+
+# Define boundaries for splitting into 4 groups based on percentage changes
+cut_points <- sort(dt_filtered$emp_avg[top_pct_change_indices])
+
+# Split into 4 groups based on filtered top percentage changes
+dt_cluster_all <- dt_cluster_all %>%
+  mutate(emp_avg_group = cut(
+    emp_avg, 
+    breaks = c(-Inf, cut_points, Inf),
+    labels = paste0("Group ", 1:8),
+    include.lowest = TRUE)
+  )
+
+
+```
+
+## Exploratory Analysis
+
+```{r exploratory-analysis, echo=FALSE}
+summary(dt_cluster_all)
+```
+## Clustering Analysis
+
+```{r clustering, warning=FALSE, message=FALSE}
+dt_cluster_changed_isic4 <- dt_cluster_all[which(grepl("\\|", dt_cluster_all$isic4)), ]
+
+dt_cluster <- dt_cluster_all[which(!grepl("\\|", dt_cluster_all$isic4)), ]
+
+# Scale the aggregated data
+dt_scaled <- dt_cluster
+
+dt_scaled <- dt_scaled[, c("company_name", "isic4", "isic4_dh", rnd_vars_cluster)]
+
+dt_scaled <- dt_scaled %>% filter(complete.cases(.))
+
+summary(dt_scaled)
+
+if (replace_outliers_before_scaling) {
+  dt_scaled[, rnd_vars_cluster] <- sapply(
+    rnd_vars_cluster,
+    function(var) {
+      temp_dt <- dt_scaled[, var] %>% pull()
+      box <- boxplot(temp_dt, plot = FALSE)
+      
+      min_lim <- ifelse(
+        box$stats[1] < 0,
+        box$stats[1] * 3,
+        box$stats[1] * 0.33
+      )
+      max_lim <- ifelse(
+        box$stats[5] < 0,
+        box$stats[5] * 0.33,
+        box$stats[5] * 3
+      )
+      # hist(temp_dt)
+      temp_dt[temp_dt < min_lim] <- min_lim 
+      temp_dt[temp_dt > max_lim] <- max_lim
+      # hist(temp_dt)
+      return(temp_dt)
+    }
+  )
+}
+
+summary(dt_scaled)
+
+dt_scaled[, rnd_vars_cluster] <- scale(dt_scaled[, rnd_vars_cluster])
+
+dt_cluster_out <- dt_cluster %>%
+  filter(company_name %in% unique(dt_scaled$company_name))
+
+```
+
+```{r}
+# Check if dimensionality reduction is enabled
+if (reduce_dim) {
+  dt_scaled_original <- dt_scaled
+  test_dt <- dt_scaled %>% select(c(rnd_vars_cluster))
+  pca_result <- prcomp(test_dt, scale = TRUE)
+
+  # Visualize PCA
+  autoplot(pca_result, data = test_dt)
+  dt_scaled <- pca_result$x[, 1:2]
+  rnd_vars_cluster <- colnames(dt_scaled)
+  
+  dt_scaled <- bind_cols(
+    dt_scaled_original %>% select(setdiff(colnames(dt_scaled_original), colnames(test_dt))),
+    dt_scaled
+  )
+}
+```
+
+## Optimal Number of Clusters
+
+```{r optimal-clusters, fig.width=12, fig.height=8}
+n_clusters_all <- list()
+
+pdf(
+  file = paste0(dir2, "suggested_number_of_clusters.pdf"),
+  width = 12, height = 8
+)
+
+for (i in test_clust) {
+  # Calculate the optimal number of clusters for each method
+  n_clust <- calc_clusters_manual(
+    data = dt_scaled[, rnd_vars_cluster],
+    method = i,
+    max_clusters = length(unique(dt_scaled$isic4_dh)),
+    random_seed = 123
+  )
+  n_clusters_all[[i]] <- n_clust
+  
+  # Print out the suggested number of clusters
+  cat(paste0("Method: ", i, " suggested number of clusters: ", n_clusters_all[[i]], "\n"))
+}
+
+dev.off()
+
+for (i in test_clust) {
+  # Calculate the optimal number of clusters for each method
+  n_clust <- calc_clusters_manual(
+    data = dt_scaled[, rnd_vars_cluster],
+    method = i,
+    max_clusters = length(unique(dt_scaled$isic4_dh)),
+    random_seed = 123
+  )
+  n_clusters_all[[i]] <- n_clust
+  
+}
+
+```
+
+## Clustering Results
+
+```{r clustering-results}
+# Initialize an empty list to store results for each number of clusters
+results_list <- list()
+
+# Iterate over different clustering methods
+for (i in seq_len(length(n_clusters_all))) {
+  
+  n_clusters <- n_clusters_all[[i]]
+  cat(paste0("Running clustering for ", n_clusters, " clusters\n"))
+  
+  # K-means Clustering
+  kmeans_result <- kmeans(dt_scaled[, rnd_vars_cluster], centers = n_clusters, nstart = 25)
+  dt_cluster_out$kmeans_cluster <- as.factor(kmeans_result$cluster)
+  
+  # Hierarchical Clustering
+  dist_matrix <- dist(dt_scaled[, rnd_vars_cluster], method = "euclidean")
+  hc <- hclust(dist_matrix, method = "ward.D2")
+  dt_cluster_out$hc_cluster <- cutree(hc, k = n_clusters)
+  
+  # Gaussian Mixture Model (GMM)
+  gmm_model <- Mclust(dt_scaled[, rnd_vars_cluster], n_clusters)
+  dt_cluster_out$gmm_cluster <- gmm_model$classification
+  
+  # Validation Metrics
+  # Silhouette Scores
+  silhouette_kmeans <- silhouette(as.numeric(dt_cluster_out$kmeans_cluster), dist(dt_scaled[, rnd_vars_cluster]))
+  avg_silhouette_kmeans <- mean(silhouette_kmeans[, 3])
+  
+  silhouette_hc <- silhouette(as.numeric(dt_cluster_out$hc_cluster), dist(dt_scaled[, rnd_vars_cluster]))
+  avg_silhouette_hc <- mean(silhouette_hc[, 3])
+  
+  silhouette_gmm <- silhouette(as.numeric(dt_cluster_out$gmm_cluster), dist(dt_scaled[, rnd_vars_cluster]))
+  avg_silhouette_gmm <- mean(silhouette_gmm[, 3])
+  
+  # Calinski-Harabasz Index
+  dist_matrix <- dist(dt_scaled[, rnd_vars_cluster])
+  
+  cluster_stats_kmeans <- cluster.stats(dist_matrix, as.numeric(dt_cluster_out$kmeans_cluster))
+  calinski_harabasz_kmeans <- cluster_stats_kmeans$ch
+  
+  cluster_stats_hc <- cluster.stats(dist_matrix, as.numeric(dt_cluster_out$hc_cluster))
+  calinski_harabasz_hc <- cluster_stats_hc$ch
+  
+  cluster_stats_gmm <- cluster.stats(dist_matrix, as.numeric(dt_cluster_out$gmm_cluster))
+  calinski_harabasz_gmm <- cluster_stats_gmm$ch
+  
+  # Davies-Bouldin Index
+  davies_bouldin_kmeans <- intCriteria(as.matrix(dt_scaled[, rnd_vars_cluster]), as.integer(dt_cluster_out$kmeans_cluster), "Davies_Bouldin")$davies_bouldin
+  
+  davies_bouldin_hc <- intCriteria(as.matrix(dt_scaled[, rnd_vars_cluster]), as.integer(dt_cluster_out$hc_cluster), "Davies_Bouldin")$davies_bouldin
+  
+  davies_bouldin_gmm <- intCriteria(as.matrix(dt_scaled[, rnd_vars_cluster]), as.integer(dt_cluster_out$gmm_cluster), "Davies_Bouldin")$davies_bouldin
+  
+  # Summary and Comparison
+  validation_results <- data.frame(
+    Method = c("K-means", "Hierarchical", "GMM"),
+    Avg_Silhouette = c(avg_silhouette_kmeans, avg_silhouette_hc, avg_silhouette_gmm),
+    Calinski_Harabasz = c(calinski_harabasz_kmeans, calinski_harabasz_hc, calinski_harabasz_gmm),
+    Davies_Bouldin = c(davies_bouldin_kmeans, davies_bouldin_hc, davies_bouldin_gmm)
+  )
+  
+  # Normalize metrics
+  validation_results <- validation_results %>%
+    mutate(
+      Silhouette_Norm = (Avg_Silhouette - min(Avg_Silhouette)) / (max(Avg_Silhouette) - min(Avg_Silhouette)),
+      CH_Norm = (Calinski_Harabasz - min(Calinski_Harabasz)) / (max(Calinski_Harabasz) - min(Calinski_Harabasz)),
+      DB_Norm = (max(Davies_Bouldin) - Davies_Bouldin) / (max(Davies_Bouldin) - min(Davies_Bouldin))
+    ) %>%
+    mutate(Composite_Score = rowMeans(select(., Silhouette_Norm, CH_Norm, DB_Norm)))
+  
+  # Cramér's V, Chi-Square, and ARI
+  contingency_table_kmeans <- table(dt_cluster_out$kmeans_cluster, dt_cluster_out$isic4_dh)
+  contingency_table_hc <- table(dt_cluster_out$hc_cluster, dt_cluster_out$isic4_dh)
+  contingency_table_gmm <- table(dt_cluster_out$gmm_cluster, dt_cluster_out$isic4_dh)
+  
+  assoc_stats_kmeans <- assocstats(contingency_table_kmeans)
+  assoc_stats_hc <- assocstats(contingency_table_hc)
+  assoc_stats_gmm <- assocstats(contingency_table_gmm)
+  
+  cramers_v_kmeans <- assoc_stats_kmeans$cramer
+  cramers_v_hc <- assoc_stats_hc$cramer
+  cramers_v_gmm <- assoc_stats_gmm$cramer
+  
+  chi_square_test_kmeans <- chisq.test(contingency_table_kmeans)
+  chi_square_test_hc <- chisq.test(contingency_table_hc)
+  chi_square_test_gmm <- chisq.test(contingency_table_gmm)
+  
+  ari_score_kmeans <- adjustedRandIndex(dt_cluster_out$kmeans_cluster, dt_cluster_out$isic4_dh)
+  ari_score_hc <- adjustedRandIndex(dt_cluster_out$hc_cluster, dt_cluster_out$isic4_dh)
+  ari_score_gmm <- adjustedRandIndex(dt_cluster_out$gmm_cluster, dt_cluster_out$isic4_dh)
+  
+  comparison_results <- data.frame(
+    Method = c("K-means", "Hierarchical", "GMM"),
+    Cramers_V = c(cramers_v_kmeans, cramers_v_hc, cramers_v_gmm),
+    Chi_Square_p_value = c(chi_square_test_kmeans$p.value, chi_square_test_hc$p.value, chi_square_test_gmm$p.value),
+    ARI = c(ari_score_kmeans, ari_score_hc, ari_score_gmm)
+  )
+  
+  # Store results
+  results_list[[as.character(n_clusters)]] <- list(
+    validation_results = validation_results,
+    comparison_results = comparison_results,
+    kmeans_result = kmeans_result,
+    hc_result = hc,
+    gmm_result = gmm_model
+  )
+}
+
+```
+
+## Validation
+
+Metric	Best Value	Worst Value	What It Measures	Interpretation
+Silhouette Score	Close to 1	Close to -1	How well-separated and compact clusters are	Higher is better: Clusters are dense and well-separated
+Calinski-Harabasz	Higher	Lower	Ratio of between-cluster dispersion to within-cluster dispersion	Higher is better: Clusters are compact and separated
+Davies-Bouldin	Close to 0	Higher	Ratio of within-cluster scatter to between-cluster separation	Lower is better: Clusters are compact and distinct
+
+
+```{r cluster-visualization, fig.width=8, fig.height=6}
+# Review validation results
+for (n_clusters in unique(n_clusters_all)) {
+  print(as.character(n_clusters))
+  print(results_list[[as.character(n_clusters)]]$validation_results)
+}
+
+for (n_clusters in unique(n_clusters_all)) {
+  print(as.character(n_clusters))
+  print(results_list[[as.character(n_clusters)]]$comparison_results)
+}
+
+```
+
+## Visualization
+
+```{r}
+# Select final clusters using hierarchical clustering with 3 clusters
+# final_clusters <- cutree(results_list[["4"]]$hc_result, k = 4)
+
+final_clusters <- results_list$`4`$kmeans_result$cluster
+dt_scaled$clusters <- final_clusters
+
+# Prepare data for visualization
+data_matrix <- dt_scaled[, rnd_vars_cluster]
+data_matrix <- as.matrix(data_matrix)
+clusters <- dt_scaled$clusters
+
+# Visualize clusters
+clust_vis <- fviz_cluster(
+  list(data = data_matrix, cluster = clusters),
+             geom = "point",
+             ellipse.type = "convex",
+             palette = "jco",
+             ggtheme = theme_minimal(),
+             main = "Cluster Visualization"
+) + theme(
+        plot.title = element_text(size = 22, face = "bold", hjust = 0.5), # Center title
+        axis.title = element_text(size = 20),                           # Axis titles
+        axis.text = element_text(size = 18),                            # Axis labels
+        legend.title = element_text(size = 20),                         # Legend title
+        legend.text = element_text(size = 18)                           # Legend labels
+    )
+
+clust_vis_name <- paste0(dir2, "final_cluster_vis.png")
+ggsave(
+  clust_vis_name, clust_vis, bg = "white",
+    width = 16,  # cm
+    height = 10, # cm
+    dpi = 300
+)
+    
+print(clust_vis)
+
+```
+
+
+
+## adding cluster to data
+
+```{r summary}
+# Merge clustering results with original data
+rnd_data_clutered <- rnd_data %>%
+  left_join(
+    dt_scaled %>% select("company_name", "clusters"),
+    by = c("company_name")
+  ) %>%
+  mutate(
+    clusters_ctry_group = paste0(clusters, "_", ctry_code),
+    isic4_dh_ctry_group = paste0(isic4_dh, "_", ctry_code)
+  ) %>%
+  group_by(clusters_ctry_group) %>%
+  mutate(
+    n_cc_flag = case_when(
+      n_distinct(company_name) < 3 ~ TRUE,
+      TRUE ~ FALSE
+    )
+  ) %>%
+  ungroup() %>%
+  group_by(isic4_dh_ctry_group) %>%
+  mutate(
+    n_ic_flag = case_when(
+      n_distinct(company_name) < 3 ~ TRUE,
+      TRUE ~ FALSE
+    )
+  ) %>%
+  ungroup()  %>%
+  group_by(clusters, n_cc_flag) %>%
+  mutate(unique_ctry_cc = paste(unique(ctry_code), collapse = "-")) %>%
+  ungroup()  %>%
+  group_by(isic4_dh, n_ic_flag) %>%
+  mutate(unique_ctry_ic = paste(unique(ctry_code), collapse = "-")) %>%
+  ungroup() %>%
+  mutate(
+    clusters_ctry_group_agg = case_when(
+      n_cc_flag == FALSE ~ clusters_ctry_group,
+      TRUE ~ paste0(clusters, "_", unique_ctry_cc)
+    ),
+    isic4_dh_ctry_group_agg = case_when(
+      n_ic_flag == FALSE ~ isic4_dh_ctry_group,
+      TRUE ~ paste0(isic4_dh, "_", unique_ctry_ic)
+    )
+  ) %>%
+  select(
+    -c(
+      unique_ctry_cc, unique_ctry_ic, n_cc_flag, n_ic_flag
+    )
+  )
+# 11/17 update
+# new isic4_alternative added (some isic codes aggregated, one (C) splitted)
+bad_isic <- rnd_data_clutered %>%
+  group_by(isic4_dh) %>%
+  summarize(n_comp = n_distinct(company_name)) %>%
+  filter(n_comp < 20) %>%
+  pull(isic4_dh)
+
+# final with slightly updated isic4_alternative
+# rnd_data_clutered <- rnd_data_clutered %>%
+#   mutate(
+#     isic4_alternative = case_when(
+#       isic4_dh %in% bad_isic ~ "Others",
+#       isic4_dh == "C" & isic4 %in% c("10-12", "13-15", "16-18") ~ "C10-18", # food, textile, wood
+#       isic4_dh == "C" & isic4 %in% c("22-23", "24-25") ~ "C22-25", # plastic, metals
+#       isic4_dh %in% c("D", "E") ~ "D-E", # electricity and water
+#       isic4_dh == "C" ~ paste0(isic4_dh, isic4), # other groups as is
+#       TRUE ~ isic4_dh
+#     )
+#   )
+
+rnd_data_clutered <- rnd_data_clutered %>%
+  mutate(
+    isic4_alternative = case_when(
+      isic4_dh %in% bad_isic ~ "Others",
+      isic4_dh == "C" & isic4 %in% c("10-12") ~ "C10-12", # food
+      isic4_dh == "C" & isic4 %in% c("13-15", "16-18") ~ "C13-18", # textile, wood
+      isic4_dh == "C" & isic4 %in% c("22-23", "24-25") ~ "C22-25", # plastic, metals
+      isic4_dh %in% c("D", "E") ~ "D-E", # electricity and water
+      isic4_dh == "C" ~ paste0(isic4_dh, isic4), # other groups as is
+      TRUE ~ isic4_dh
+    )
+  )
+
+rnd_data_clutered %>% filter(is.na(clusters)) %>% View()
+
+
+
+rnd_data_clutered <- rnd_data_clutered %>%
+  filter(!is.na(clusters))
+
+rnd_data_clutered %>% group_by(clusters) %>% summarize(n_distinct(company_name)) %>% print()
+rnd_data_clutered %>% group_by(isic4) %>% summarize(n_distinct(company_name)) %>% print()
+rnd_data_clutered %>% group_by(isic4_dh) %>% summarize(n_distinct(company_name)) %>% print()
+rnd_data_clutered %>% group_by(isic4_alternative) %>% summarize(n_distinct(company_name)) %>% print()
+
+
+```
+
+NA clusters occured due to rd_intensity (rd / ns) variable and missing values in ns.
+Because ns will be used as control variables in modeling part I decided to drop those companies for consistency when comparing the models!
+
+## Saving the Results
+
+```{r save-results, include=FALSE}
+cat("\n--- Distribution of number of firms by group, clusters_ctry_group ---\n")
+rnd_data_clutered %>%
+  group_by(clusters_ctry_group) %>%
+  summarise(n = n_distinct(company_name)) %>%
+  ungroup() %>%
+  pull(n) %>%
+  summary() %>%
+  print()
+print(paste0("Number of groups: ", length(unique(rnd_data_clutered$clusters_ctry_group))))
+
+cat("\n--- Distribution of number of firms by group, clusters_ctry_group_agg ---\n")
+rnd_data_clutered %>%
+  group_by(clusters_ctry_group_agg) %>%
+  summarise(n = n_distinct(company_name)) %>%
+  ungroup() %>%
+  pull(n) %>%
+  summary() %>%
+  print()
+print(paste0("Number of groups: ", length(unique(rnd_data_clutered$clusters_ctry_group_agg))))
+
+cat("\n--- Distribution of number of firms by group, isic4_dh_ctry_group ---\n")
+rnd_data_clutered %>%
+  group_by(isic4_dh_ctry_group) %>%
+  summarise(n = n_distinct(company_name)) %>%
+  ungroup() %>%
+  pull(n) %>%
+  summary() %>%
+  print()
+print(paste0("Number of groups: ", length(unique(rnd_data_clutered$isic4_dh_ctry_group))))
+
+cat("\n--- Distribution of number of firms by group, isic4_dh_ctry_group_agg ---\n")
+rnd_data_clutered %>%
+  group_by(isic4_dh_ctry_group_agg) %>%
+  summarise(n = n_distinct(company_name)) %>%
+  ungroup() %>%
+  pull(n) %>%
+  summary() %>%
+  print()
+print(paste0("Number of groups: ", length(unique(rnd_data_clutered$isic4_dh_ctry_group_agg))))
+
+```
+
+```{r}
+
+# Save the results to a file
+results_list[["rnd_data_clutered"]] <- rnd_data_clutered
+save(results_list, file = paste0(dir2, "04_cluster_results_all.RData"))
+
+```
